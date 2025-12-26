@@ -17,7 +17,7 @@ import numpy as np
 
 class ExcelToMySQL:
     
-    def __init__(self, host='localhost', user='root', password='', database='hospital_db'):
+    def __init__(self, host='localhost', user='root', password='', database='database_db'):
         self.host = host
         self.user = user
         self.password = password
@@ -97,48 +97,48 @@ class ExcelToMySQL:
         print(f"  ✓ Created table: {table_name}")
     
     def fix_dataframe_structure(self, df):
-        """Fix misaligned columns in the DataFrame"""
+        """Fix misaligned columns in the DataFrame - PRESERVE NULL VALUES"""
         print("    ⚙ Checking and fixing DataFrame structure...")
         
-        # Expected columns from your data
+        # Check if this is a Patient_Tests DataFrame
+        if 'patient_test_id' in df.columns and 'discount' in df.columns:
+            print("    ⚙ Found Patient_Tests table. Data is already correctly formatted.")
+            
+            null_count = df['discount'].isna().sum()
+            zero_count = (df['discount'] == 0).sum()
+            print(f"    📊 Discount column: {null_count} NULL values, {zero_count} zero values")
+            
+            return df
+        
+        # Original code for Appointment table fix
         expected_columns = [
             'appointment_id', 'patient_id', 'doctor_id', 'appointment_date', 
             'appointment_time', 'status', 'reason', 'notes', 'suggest', 
             'fees', 'payment_method', 'discount', 'diagnosis'
         ]
         
-        # If we have the right number of columns but wrong names (misalignment)
         if len(df.columns) == len(expected_columns):
             current_cols = list(df.columns)
             
-            # Check if this is the problematic Appointment file
             if 'appointment_id' in current_cols and 'diagnosis' in current_cols:
-                # Look for rows where 'suggest' column contains numeric values (should be in 'fees')
                 problematic_rows = df[pd.to_numeric(df['suggest'], errors='coerce').notna()]
                 
                 if len(problematic_rows) > 0:
                     print(f"    ⚠ Found {len(problematic_rows)} misaligned rows. Fixing...")
                     
-                    # Create a copy to avoid SettingWithCopyWarning
                     df_fixed = df.copy()
-                    
-                    # For each problematic row, shift columns starting from 'suggest' one position right
                     mask = pd.to_numeric(df_fixed['suggest'], errors='coerce').notna()
                     
-                    # Store original values
                     suggest_vals = df_fixed.loc[mask, 'suggest'].copy()
                     fees_vals = df_fixed.loc[mask, 'fees'].copy()
                     payment_vals = df_fixed.loc[mask, 'payment_method'].copy()
                     discount_vals = df_fixed.loc[mask, 'discount'].copy()
                     diagnosis_vals = df_fixed.loc[mask, 'diagnosis'].copy()
                     
-                    # Shift values: suggest gets NaN, fees gets suggest value, etc.
                     df_fixed.loc[mask, 'suggest'] = np.nan
                     df_fixed.loc[mask, 'fees'] = pd.to_numeric(suggest_vals, errors='coerce')
                     df_fixed.loc[mask, 'payment_method'] = fees_vals
                     df_fixed.loc[mask, 'discount'] = pd.to_numeric(payment_vals, errors='coerce')
-                    
-                    # Keep diagnosis as is since it's already correct
                     
                     print(f"    ✓ Fixed {len(problematic_rows)} misaligned rows")
                     return df_fixed
@@ -148,17 +148,10 @@ class ExcelToMySQL:
     def insert_dataframe(self, df, table_name):
         cursor = self.connection.cursor()
         
-        # Debug: Show what's being inserted
-        print(f"    DEBUG: DataFrame shape before cleaning: {df.shape}")
-        if not df.empty:
-            print(f"    DEBUG: First row values:")
-            for col, val in zip(df.columns, df.iloc[0]):
-                print(f"      {col}: {val} (type: {type(val)})")
-        
         df_clean = df.copy()
         
         # Convert date and time columns properly
-        date_cols = ['appointment_date']
+        date_cols = ['appointment_date', 'test_date', 'result_date']
         time_cols = ['appointment_time']
         
         for col in df_clean.columns:
@@ -181,16 +174,18 @@ class ExcelToMySQL:
             # Handle other datetime columns
             elif pd.api.types.is_datetime64_any_dtype(df_clean[col]):
                 df_clean[col] = df_clean[col].dt.strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Replace NaN with None for MySQL
-            df_clean[col] = df_clean[col].where(pd.notna(df_clean[col]), None)
         
-        # Debug: Show cleaned data
-        print(f"    DEBUG: DataFrame shape after cleaning: {df_clean.shape}")
-        if not df_clean.empty:
-            print(f"    DEBUG: First row after cleaning:")
-            for col, val in zip(df_clean.columns, df_clean.iloc[0]):
-                print(f"      {col}: {val} (type: {type(val)})")
+        # Convert DataFrame to list of tuples and replace NaN with None
+        data = []
+        for _, row in df_clean.iterrows():
+            # Convert each value, replacing NaN/NaT with None
+            cleaned_row = []
+            for val in row:
+                if pd.isna(val):
+                    cleaned_row.append(None)
+                else:
+                    cleaned_row.append(val)
+            data.append(tuple(cleaned_row))
         
         # Prepare for insertion
         sanitized_cols = [self.sanitize_name(str(col)) for col in df_clean.columns]
@@ -199,21 +194,17 @@ class ExcelToMySQL:
         
         insert_query = f"INSERT INTO `{table_name}` ({columns_str}) VALUES ({placeholders})"
         
-        # Convert DataFrame to list of tuples
-        data = []
-        for _, row in df_clean.iterrows():
-            data.append(tuple(row))
-        
-        # Debug: Show first insert statement
-        if data:
-            print(f"    DEBUG: First INSERT statement would be:")
-            print(f"      INSERT INTO `{table_name}` ({columns_str})")
-            print(f"      VALUES {data[0]}")
-        
         try:
             cursor.executemany(insert_query, data)
             self.connection.commit()
-            print(f"  ✓ Inserted {len(df_clean)} rows into {table_name}")
+            print(f"  ✓ Inserted {len(data)} rows into {table_name}")
+            
+            # Show count of NULL values in discount column if it exists
+            if 'discount' in df.columns:
+                null_count = df['discount'].isna().sum()
+                zero_count = (df['discount'] == 0).sum()
+                print(f"  📊 Discount column stats: {null_count} NULL values, {zero_count} zero values")
+                
         except Error as e:
             print(f"  ✗ Error inserting data: {e}")
             print(f"  First problematic row: {data[0] if data else 'No data'}")
@@ -228,7 +219,6 @@ class ExcelToMySQL:
             print(f"\n📊 Processing: {Path(file_path).name}")
             print(f"  Full path: {file_path}")
             
-            # Try different Excel engines if needed
             try:
                 excel_file = pd.ExcelFile(file_path, engine='openpyxl')
             except:
@@ -242,50 +232,31 @@ class ExcelToMySQL:
             for sheet_name in sheets:
                 print(f"\n  ── Analyzing sheet: '{sheet_name}' ──")
                 
-                # Read the Excel file
                 try:
                     df = pd.read_excel(file_path, sheet_name=sheet_name, engine='openpyxl')
                 except:
                     df = pd.read_excel(file_path, sheet_name=sheet_name)
                 
-                # Debug information
                 print(f"    DataFrame shape: {df.shape}")
                 print(f"    DataFrame empty? {df.empty}")
                 print(f"    Columns ({len(df.columns)}): {list(df.columns)}")
                 
-                # Show column dtypes
-                print(f"    Column dtypes:")
-                for col in df.columns:
-                    print(f"      {col}: {df[col].dtype}")
-                
-                # Check if DataFrame has data
                 if df.empty:
                     print(f"    ⚠ DataFrame is completely empty")
                     continue
                 
-                # Check for non-empty rows
                 non_empty_rows = df.dropna(how='all').shape[0]
                 if non_empty_rows == 0:
                     print(f"    ⚠ DataFrame has only NaN/empty values")
-                    # Show raw data
-                    print(f"    Raw data (first 3 rows):")
-                    print(df.head(3).to_string())
                     continue
                 
                 print(f"    Rows with data: {non_empty_rows}/{df.shape[0]}")
                 
-                # Fix misaligned data (specifically for Appointment.xlsx)
-                if file_name.lower() == 'appointment':
+                if file_name.lower() in ['appointment', 'patient_tests']:
                     df = self.fix_dataframe_structure(df)
                 
-                # Show sample data
-                print(f"    Sample data (first 3 rows):")
-                print(df.head(3).to_string(index=False))
-                
-                # Now we have data
                 file_has_data = True
                 
-                # Determine table name
                 if len(sheets) > 1:
                     table_name = self.sanitize_name(f"{file_name}_{sheet_name}")
                 else:
@@ -302,7 +273,6 @@ class ExcelToMySQL:
                     traceback.print_exc()
                     continue
             
-            # Final check
             if not file_has_data:
                 print(f"\n  ⚠ File '{Path(file_path).name}' contains no usable data.")
                 return None
@@ -342,7 +312,7 @@ class ExcelToMySQL:
                 successful += 1
             elif result is False:
                 failed += 1
-            else:  # result is None (empty file)
+            else:
                 empty += 1
         
         print(f"\n{'='*60}")
@@ -365,17 +335,14 @@ class ExcelToMySQL:
                 for i, table in enumerate(tables, 1):
                     print(f"  {i}. {table[0]}")
                     
-                    # Show table structure
                     cursor.execute(f"DESCRIBE `{table[0]}`")
                     columns = cursor.fetchall()
                     print(f"     Columns: {len(columns)}")
                     
-                    # Show row count
                     cursor.execute(f"SELECT COUNT(*) FROM `{table[0]}`")
                     count = cursor.fetchone()[0]
                     print(f"     Rows: {count}")
                     
-                    # Show first few rows
                     if count > 0:
                         cursor.execute(f"SELECT * FROM `{table[0]}` LIMIT 3")
                         sample_rows = cursor.fetchall()
@@ -383,7 +350,10 @@ class ExcelToMySQL:
                         column_names = [col[0] for col in cursor.fetchall()]
                         print(f"     Sample data (first 3 rows):")
                         for row in sample_rows:
-                            print(f"       {dict(zip(column_names, row))}")
+                            row_dict = {}
+                            for col_name, value in zip(column_names, row):
+                                row_dict[col_name] = value if value is not None else "NULL"
+                            print(f"       {row_dict}")
             else:
                 print(f"\n📋 No tables found in database '{self.database}'")
             
@@ -407,7 +377,7 @@ def main():
         'host': input("  MySQL Host [localhost]: ").strip() or 'localhost',
         'user': input("  MySQL User [root]: ").strip() or 'root',
         'password': input("  MySQL Password: ").strip(),
-        'database': input("  Database Name [hospital_db]: ").strip() or 'hospital_db'
+        'database': input("  Database Name [database_db]: ").strip() or 'database_db'
     }
     
     DATASET_FOLDER = input("\n📁 Dataset Folder [dataset]: ").strip() or 'dataset'
